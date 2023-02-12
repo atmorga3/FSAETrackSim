@@ -25,11 +25,11 @@ TIRE_DATA = scipy.io.loadmat(TIRE_DATA_FILE_PATH)['full_send_x']['coefs']
 ENGINE_RPM_LOWER_LIMIT = 6200
 ENGINE_RPM_STEP_SIZE = 100
 ENGINE_RPM_UPPER_LIMIT = 14100
+ENGINE_RPM = np.arange(ENGINE_RPM_LOWER_LIMIT, ENGINE_RPM_UPPER_LIMIT, ENGINE_RPM_STEP_SIZE, dtype=int)
 ENGINE_TORQUE_CSV_FILE_NAME = "Config\Engine_Torque.csv"    # (Nm)
+ENGINE_TORQUE = pd.read_csv(ENGINE_TORQUE_CSV_FILE_NAME, sep=',', header=None).to_numpy()[0]
 OPTIMAL_SHIFT_RPM = 14000
 SHIFT_TIME = .25    # (seconds)
-engine_RPM = []
-engine_torque = []
 
 
 # DRIVETRAIN CONSTANTS
@@ -84,9 +84,28 @@ REAR_DOWNFORCE_DIST = (1 - FRONT_DOWNFORCE_DIST) # percentage
 #################################################
 
 # PowerTrainSimulation
-def calcPowerTrain(initial_velocity):
-    
+# returns 
+def calcPowerTrain(initial_velocity, gear_ratios):
+    guessRPM = ENGINE_RPM_UPPER_LIMIT
+    current_gear = 0
+    gearTot = 0
 
+    while guessRPM > OPTIMAL_SHIFT_RPM :
+        curremt_gear += 1
+        gearTot = gear_ratios[current_gear] * FINAL_DRIVE * PRIMARY_REDUCTION
+        guessRPM = initial_velocity * gearTot / TYRE_RADIUS * 60 / (2 * math.pi)
+
+    # NOTE: There has to be a better way to do this
+    index = 2
+    while guessRPM > ENGINE_RPM[index] :
+        index += 1
+    torque = ENGINE_TORQUE[index-1]+(ENGINE_TORQUE[index]-ENGINE_TORQUE[index-1])/(ENGINE_RPM[index]-ENGINE_RPM[index-1])*(guessRPM-ENGINE_RPM[index-1])
+
+    torque = torque * gearTot * DRIVETRAIN_LOSS_CONSTANT #torque output at the wheels
+
+    contact_force = torque / TYRE_RADIUS    #force on contact patch from drivtrain (N)
+
+    return([contact_force, current_gear])
 
 # replace this with fitment for a specific tyre curve
 def fitTyreData(a, arr):
@@ -94,10 +113,11 @@ def fitTyreData(a, arr):
 
 # The approach to cacluating GGV is as follows
 # 1. calculate lateral Acceleration
-# 2. calculate braking performance
-
-
-def generateGGV(velocity_range, radii):
+# 2. calculate cornering envelope
+# 3. calculate braking performance
+def generateGGV(velocity_range, radii, gear_ratios):
+    # calculating the acceleration capacity
+    # calculates the max acceleration at every velocity
     current_gear = 1
     accel_array = []
     for velocity in velocity_range :
@@ -186,19 +206,24 @@ def generateGGV(velocity_range, radii):
         
             total_lateral_accel = total_tyre_tractive_force / WEIGHT
             accel_delta = total_lateral_accel - accel
-            
-        accel_array.append(total_lateral_accel)
         
+        accel_array.append(total_lateral_accel)
+        calcPowerTrain(max(7.5, velocity/3.28), gear_ratios)
+
+    # calculate cornering envelope by guessing ay and then
+    # increasing it incrementally
+    # we evaluate cornering performance based on the radius of a turn instead of speed
+
+    
+
+    # for radius in radii :
+
+    
         
             
             
         
 def main():
-
-    # engine setup 
-    engine_RPM = np.arange(ENGINE_RPM_LOWER_LIMIT, ENGINE_RPM_UPPER_LIMIT, ENGINE_RPM_STEP_SIZE, dtype=int)
-    engine_torque = pd.read_csv(ENGINE_TORQUE_CSV_FILE_NAME, sep=',', header=None).to_numpy()[0]
-    
     # drivetrain setup
     gear_ratios = pd.read_csv(GEAR_RATIOS_CSV_FILE_NAME, sep=',', header=None).to_numpy()[0]
     gear_total = gear_ratios[-1] * FINAL_DRIVE * PRIMARY_REDUCTION
@@ -208,8 +233,11 @@ def main():
     velocity_range = np.arange(15, Vmax, 5)
     radii = np.arange(15, 155, 10)  # might be wrong
     
+    # FOR TESTING
+    print(calcPowerTrain(10))
+
     # calculate the acceleration envelope
-    generateGGV(velocity_range, radii)
+    generateGGV(velocity_range, radii, gear_ratios)
     
     
     

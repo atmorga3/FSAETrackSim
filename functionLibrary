@@ -1,0 +1,33 @@
+import numpy as np
+from scipy.interpolate import RegularGridInterpolator
+import scipy.interpolate
+import matplotlib.pyplot as plt
+import pandas as pd
+
+import scipy.io
+
+# fig = plt.figure()
+# ax = fig.add_subplot(projection='3d')
+
+
+data = scipy.io.loadmat('Config\Hoosier_R25B_18.0x7.5-10_FX_12psi.mat')['full_send_x']#['coefs'][0][0]
+
+print(data['coefs'][0][0][0][0][0][0])
+
+# remove dtype=... from end of arrays and make type float
+breaks = [np.array(i[0], dtype=float) for i in data['breaks'][0][0][0]]
+breaks = np.array(breaks)
+
+coefs = np.array(data['coefs'][0][0][0], dtype=float)
+
+# coefs = np.reshape(coefs, (3,1) + coefs.shape[1:])
+print(breaks[0].shape, coefs.shape)
+# print(data['pieces'].size)
+# print(data['pieces'][0].size)
+pieces = np.array(data['pieces'][0][0], dtype=int)
+order = np.array(data['order'][0][0], dtype=int)
+
+pp = scipy.interpolate.BPoly(coefs, breaks)
+
+
+# print(spl([0,-7.381423602484471, .0000009518839229397756]))

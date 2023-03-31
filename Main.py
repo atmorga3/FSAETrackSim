@@ -1,8 +1,10 @@
 # Aidan Morgan
+# atmorga3@asu.edu
 # 2-9-2023
-# Created from Jonathan Vogel's Lap Sim in matlab
+# Reworked and expanded on from Jonathan Vogel's Lap Sim in matlab
 # FSAE Lap Simulation
 
+# IMPORTS
 import pandas as pd
 import random
 import numpy as np
@@ -10,6 +12,7 @@ import scipy.io
 from scipy.interpolate import InterpolatedUnivariateSpline as ius
 import math
 from csaps import csaps
+import statistics as stat
 
 ################################################
 # CONSTANTS #
@@ -19,6 +22,8 @@ TYRE_SCALING_FACTOR_Y = .47
 TYRE_RADIUS = 9.05 / 12 / 3.28
 TIRE_DATA_FILE_PATH = "Config\Hoosier_R25B_18.0x7.5-10_FX_12psi.mat"
 TIRE_DATA = scipy.io.loadmat(TIRE_DATA_FILE_PATH)['full_send_x']['coefs']
+MAGIC_FORMULA_A_CONSTANTS_FILE_PATH = "Config\A1654run21_MF52_Fy_12.mat"
+MAGIC_FORMULA_A_CONSTANTS = scipy.io.loadmat(MAGIC_FORMULA_A_CONSTANTS_FILE_PATH)['A'][0]
 
 
 # ENGINE CONSTANTS
@@ -73,6 +78,8 @@ FRONT_INDUCED_ROLL = math.asin(2 / FRONT_TRACK_WIDTH / 12)  # change name
 REAR_INDUCED_ROLL = math.asin(2 / REAR_TRACK_WIDTH / 12)   # change name
 FRONT_CAMBER_GAIN = FRONT_INDUCED_ROLL * FRONT_CAMBER_COMPENSATION
 REAR_CAMBER_GAIN = REAR_INDUCED_ROLL * REAR_CAMBER_COMPENSATION
+FRONT_ACKERMANN = 0     # not sure if this is correct
+REAR_ACKERMANN = 0
 
 
 # AERO CONSTANTS
@@ -80,9 +87,100 @@ LIFT_COEFFICIENT = .0418
 DRAG_COEFFICIENT = .0184
 FRONT_DOWNFORCE_DIST = .48  # percentage
 REAR_DOWNFORCE_DIST = (1 - FRONT_DOWNFORCE_DIST) # percentage
-
+# TODO: Add drs based on turn radius? Swap to a different aero coefficients is a DRS constant is 1?
 #################################################
 
+# updates the accel given 
+def calcAccel(current_speed, vehicle_side_slip_angle, radius, front_axle_load, rear_axle_load, steer_angle, initial_camber_gain_front, initial_camber_gain_rear, grip_scale): 
+    accel_y = current_speed**2 / radius
+        
+    # calc lateral load transfer
+    new_weight = accel_y * CENTER_OF_GRAVITY * WEIGHT / stat.mean([FRONT_TRACK_WIDTH, REAR_TRACK_WIDTH])/ 32.2 / 12
+    
+    # split weight to front and rear using LAT_LOAD_TRANSFER_DIST
+    new_weight_front = new_weight * LAT_LOAD_TRANSFER_DIST
+    new_weight_rear = new_weight * (1 - LAT_LOAD_TRANSFER_DIST)
+    
+    # calculate front / rear roll (rad)
+    phi_front = accel_y * FRONT_ROLL_GRAD * math.pi / 180 / 32.2
+    phi_rear = accel_y * REAR_ROLL_GRAD * math.pi / 180 / 32.2
+    
+    # update individual wheel loads
+    wheel_inside_front = front_axle_load - new_weight_front
+    wheel_outside_front = front_axle_load + new_weight_front
+    wheel_inside_rear = rear_axle_load - new_weight_rear
+    wheel_outside_rear = rear_axle_load + new_weight_rear
+    
+    # update individual wheel camber from roll and then from steering effects
+    
+    camber_inside_front, camber_outside_front, camber_inside_rear, camber_outside_rear = updateCamber(phi_front, phi_rear, initial_camber_gain_front, initial_camber_gain_rear, steer_angle, REAR_ACKERMANN)
+    
+    yaw_rate = accel_y / current_speed
+    
+    # calulate slip angles from side slip and steer
+    
+    slip_angle_front = vehicle_side_slip_angle + FRONT_AXLE_TO_CG * yaw_rate / current_speed - steer_angle
+    slip_angle_rear = vehicle_side_slip_angle - REAR_AXLE_TO_CG * yaw_rate / current_speed - REAR_ACKERMANN
+    
+    # calculate lateral force at front accounting for slip angle, load, and camber by plugging it in to da magic formula
+    front_force_inside = -getLateralForce(MAGIC_FORMULA_A_CONSTANTS, -math.degrees(slip_angle_front), wheel_inside_front, -math.degrees(camber_inside_front)) * TYRE_SCALING_FACTOR_Y * math.cos(steer_angle)
+    front_force_outside = getLateralForce(MAGIC_FORMULA_A_CONSTANTS, math.degrees(slip_angle_front), wheel_outside_front, -math.degrees(camber_outside_front)) * TYRE_SCALING_FACTOR_Y * math.cos(steer_angle)
+    
+    # for the rear tire forces we must see what forces the the dif has to overcome
+    # drag on the front tires from aero and front tires
+    force_x = DRAG_COEFFICIENT  * current_speed ** 2 + (front_force_inside + front_force_outside) * math.sin(steer_angle) / math.cos(steer_angle)
+    
+    # calculate the grip penalty becuase the rear tyres must over come that
+    grip_scale = 1 - (force_x / WEIGHT / grip_scale(current_speed))**2
+    
+    # now calculate rear tire forces with the penalty
+    rear_force_inside = -getLateralForce(MAGIC_FORMULA_A_CONSTANTS, -math.degrees(slip_angle_rear), wheel_inside_rear, - math.degrees(camber_inside_rear)) * TYRE_SCALING_FACTOR_Y * grip_scale
+    rear_force_outside = getLateralForce(MAGIC_FORMULA_A_CONSTANTS, math.degrees(slip_angle_rear), wheel_outside_rear, - math.degrees(camber_outside_rear)) * TYRE_SCALING_FACTOR_Y * grip_scale
+    
+    # now we calculate the sum of the forces and moments
+    sum_f_y = front_force_inside + front_force_outside + rear_force_inside + rear_force_outside
+    moment_z_diff = force_x * DIF_LOCK * REAR_TRACK_WIDTH / 2   #differential contribution
+    moment_z = (front_force_inside + front_force_outside) * FRONT_AXLE_TO_CG - (rear_force_inside + rear_force_outside) * REAR_AXLE_TO_CG - moment_z_diff
+    
+    #calculate resultant lateral acceleration
+    actual_lateral_accel = sum_f_y / WEIGHT / 32.2
+    accel_difference = accel_y - actual_lateral_accel
+    return accel_difference
+
+# uses the magic formula to find lateral force on the tyres
+def getLateralForce(magic_constants, slip_angle, wheel_load, camber_angle):
+    A = magic_constants
+    Alpha = math.radians(slip_angle)    #converts slip angle to radians
+    Fz = abs(wheel_load)
+    Gamma = math.radians(camber_angle)  #converts camber angle to radians
+
+    Gammay = Gamma
+    Fz0PR = -150
+    DFz = (Fz - Fz0PR) / Fz0PR
+    
+    SHy = (A[11] + A[12] * DFz) * 1 + A[13] * Gammay
+    Alphay = Alpha + SHy
+    Cy = A[0]
+    MUy = (A[1] + A[2] * DFz) * (1 - A[3] * Gammay**2) * 1
+    Dy = MUy * Fz
+    Ky = A[8] * -150 * math.sin(2 * math.atan(Fz / (A[9] * -150 ))) * (1 - A[10] * abs(Gammay)) 
+    By = Ky / (Cy * Dy)
+    
+    Ey = (A[4] + A[5] * DFz) * (1-(A[6] + A[7] * Gammay) * np.sign(Alphay))
+    
+    SVy = Fz * ((A[14] + A[15] * DFz) * 1+(A[16] + A[17] * DFz) * Gammay)
+    Fy0 = Dy * math.sin(Cy * math.atan(By * Alphay - Ey * (By * Alphay - math.atan(By * Alphay)))) + SVy
+    return Fy0
+
+# updates camber from roll and then from steering
+def updateCamber(phi_front, phi_rear, initial_camber_gain_front, initial_camber_gain_rear, ackermannf, ackermannr):
+    camber_fin = -FRONT_TRACK_WIDTH * math.sin(phi_front) * 12 / 2 * FRONT_CAMBER_GAIN - initial_camber_gain_front - FRONT_KINGPIN_INCL_ANGLE * (1 - math.cos(ackermannf)) - FRONT_CASTER_ANGLE * math.sin(ackermannf) + phi_front
+    camber_fout = -FRONT_TRACK_WIDTH * math.sin(phi_front) * 12 / 2 * FRONT_CAMBER_GAIN + initial_camber_gain_front + FRONT_KINGPIN_INCL_ANGLE * (1 - math.cos(ackermannf)) - FRONT_CASTER_ANGLE * math.sin(ackermannf) + phi_front
+    camber_rin = REAR_TRACK_WIDTH * math.sin(phi_rear) * 12 / 2 * FRONT_CAMBER_GAIN - initial_camber_gain_rear - REAR_KINGPIN_INCL_ANGLE * (1 - math.cos(ackermannr)) - FRONT_CASTER_ANGLE * math.sin(ackermannr) + phi_rear
+    camber_rout = REAR_TRACK_WIDTH * math.sin(phi_rear) * 12 / 2 * FRONT_CAMBER_GAIN + initial_camber_gain_rear + REAR_KINGPIN_INCL_ANGLE * (1 - math.cos(ackermannr)) - FRONT_CASTER_ANGLE * math.sin(ackermannr) + phi_rear
+    return camber_fin, camber_fout, camber_rin, camber_rout
+    
+    
 # PowerTrainSimulation
 # returns 
 def calcPowerTrain(initial_velocity, gear_ratios):
@@ -91,7 +189,7 @@ def calcPowerTrain(initial_velocity, gear_ratios):
     gearTot = 0
 
     while guessRPM > OPTIMAL_SHIFT_RPM :
-        curremt_gear += 1
+        current_gear += 1
         gearTot = gear_ratios[current_gear] * FINAL_DRIVE * PRIMARY_REDUCTION
         guessRPM = initial_velocity * gearTot / TYRE_RADIUS * 60 / (2 * math.pi)
 
@@ -105,7 +203,7 @@ def calcPowerTrain(initial_velocity, gear_ratios):
 
     contact_force = torque / TYRE_RADIUS    #force on contact patch from drivtrain (N)
 
-    return([contact_force, current_gear])
+    return(contact_force, current_gear)
 
 # replace this with fitment for a specific tyre curve
 def fitTyreData(a, arr):
@@ -120,8 +218,14 @@ def generateGGV(velocity_range, radii, gear_ratios):
     # calculates the max acceleration at every velocity
     current_gear = 1
     accel_array = []
+    another_accel_array = []
+    front_forces = []
+    front_accel = []
+    gears = []
+    shift_count = 1
+    shift_velocities = [0]
     for velocity in velocity_range :
-        gear = current_gear
+        gear_prev = current_gear
         downforce = LIFT_COEFFICIENT * (velocity ** 2) # (lbs)
         
         # calculate suspension drop from downforce (inches)
@@ -208,16 +312,73 @@ def generateGGV(velocity_range, radii, gear_ratios):
             accel_delta = total_lateral_accel - accel
         
         accel_array.append(total_lateral_accel)
-        calcPowerTrain(max(7.5, velocity/3.28), gear_ratios)
+        contact_force, current_gear = calcPowerTrain(max(7.5, velocity/3.28), gear_ratios)
+
+        front_tractive_force_cap = contact_force * .2248    # why .2248
+        front_tractive_force_cap -= DRAG_COEFFICIENT * velocity **2
+        front_forces.append(front_tractive_force_cap / WEIGHT)
+        front_accel.append(min(front_tractive_force_cap/WEIGHT, total_lateral_accel))
+        contact_force, current_gear = calcPowerTrain(velocity/3.28, gear_ratios)
+        gears.append(current_gear)
+        if current_gear > gear_prev :
+            shift_count += 1
+            shift_velocities.append(velocity)
+        another_accel_array.append(front_accel[-1])
+    
+    # if the acceleration is less than 0 make it 0
+    another_accel_array = [a if a > 0 else  0 for a in another_accel_array]
+
+    accel_spline = csaps(velocity_range, another_accel_array)
+    grip_spline = csaps(velocity_range, accel_array)
+    print(grip_spline, accel_spline)
+
 
     # calculate cornering envelope by guessing ay and then
     # increasing it incrementally
     # we evaluate cornering performance based on the radius of a turn instead of speed
 
+    lat_accel_cap = 1
     
+    for radius in radii :
+        current_speed = math.sqrt(radius * 32.2 * lat_accel_cap)
+        downforce = LIFT_COEFFICIENT * (current_speed ** 2)
+        
+        # account for downforce in suspension travel aka heave (in)
+        sus_drop_front = downforce * FRONT_DOWNFORCE_DIST / 2 / FRONT_RIDE_RATE
+        sus_drop_rear = downforce * REAR_DOWNFORCE_DIST / 2 / REAR_RIDE_RATE
+        
+        # from suspension heave, update static camber (rad)
+        initial_camber_gain_front = FRONT_STATIC_CAMBER_ANGLE - sus_drop_front * FRONT_CAMBER_GAIN
+        initial_camber_gain_rear = REAR_STATIC_CAMBER_ANGLE - sus_drop_rear * REAR_CAMBER_GAIN
+        
+        # update load on each axle (lbs)
+        front_axle_load = (FRONT_WEIGHT + downforce * FRONT_DOWNFORCE_DIST) / 2
+        rear_axle_load = (REAR_WEIGHT + downforce * REAR_DOWNFORCE_DIST) / 2
 
-    # for radius in radii :
-
+        # guess ACKERMANN (for now we guess the ackermann)
+        steer_angle = WHEELBASE / radius
+        delta_ackermann = steer_angle * .01   # .01 is a change constanst it seems
+        
+        # assume vehicle sideslip starts at 0 (rad)
+        vehicle_side_slip_angle = 0
+        
+        accel_difference = calcAccel(current_speed, vehicle_side_slip_angle, radius, front_axle_load, rear_axle_load, steer_angle, initial_camber_gain_front, initial_camber_gain_rear, grip_spline)
+        
+        # change sideslip angle until the initial guess and resultant are the same
+        # NOTE: This can probably be made faster by changing how much we vary beta based on the magnitude of accel_difference
+        while abs(accel_difference) > 0.5:
+            slip_angle_increment = .0025
+            if accel_difference > 0 :
+                vehicle_side_slip_angle += slip_angle_increment     # increase in slip angle
+            else :
+                vehicle_side_slip_angle -= slip_angle_increment     # decrease the slip angle
+            
+            accel_difference = calcAccel(current_speed, vehicle_side_slip_angle, radius, front_axle_load, rear_axle_load, steer_angle, initial_camber_gain_front, initial_camber_gain_rear, grip_spline)
+            print(accel_difference)
+            
+            
+         
+        
     
         
             
@@ -234,15 +395,15 @@ def main():
     radii = np.arange(15, 155, 10)  # might be wrong
     
     # FOR TESTING
-    print(calcPowerTrain(10))
+    # print(getLateralForce(MAGIC_FORMULA_A_CONSTANTS, 9.6289, 161.5368, -0.0067))
+    # print(getLateralForce(MAGIC_FORMULA_A_CONSTANTS, 5.7773, 164.7671, -0.0112))
+    # print(calcPowerTrain(20, gear_ratios))
+    # print(MAGIC_FORMULA_A_CONSTANTS)
 
     # calculate the acceleration envelope
     generateGGV(velocity_range, radii, gear_ratios)
+    print("done")
     
-    
-    
-    
-    print(FRONT_CAMBER_GAIN)
 
 
 if __name__ == '__main__' :
